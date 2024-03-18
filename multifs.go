@@ -39,34 +39,19 @@ func (e MultiFSError) Error() string {
 // with writing and context capabilities
 type FS interface {
 	Open(name string) (File, error)
-	OpenContext(ctx context.Context, name string) (File, error)
 	OpenFile(name string, flag int, perm fs.FileMode) (File, error)
-	OpenFileContext(ctx context.Context, name string, flag int, perm fs.FileMode) (File, error)
 	Mkdir(name string, perm fs.FileMode) error
-	MkdirContext(ctx context.Context, name string, perm fs.FileMode) error
 	MkdirAll(path string, perm fs.FileMode) error
-	MkdirAllContext(ctx context.Context, path string, perm fs.FileMode) error
 	Remove(name ...string) error
-	RemoveContext(ctx context.Context, name ...string) error
-}
-
-// ContextReader is the interface that wraps a read method with context.
-type ContextReader interface {
-	ReadContext(ctx context.Context, b []byte) (int, error)
-}
-
-// ContextWriter is the interface that wraps a read method with context.
-type ContextWriter interface {
-	WriteContext(ctx context.Context, b []byte) (int, error)
+	WithContext(ctx context.Context) FS
 }
 
 // File is an implementation of and extends io/fs.File
 // with writing and context capabilities
 type File interface {
 	fs.File
-	ContextReader
 	io.Writer
-	ContextWriter
+	WithContext(ctx context.Context) File
 }
 
 // FileInfo implements fs.FileInfo and

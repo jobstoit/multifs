@@ -4,61 +4,56 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"io"
 	"io/fs"
 )
 
 type (
-	Option func(*OptionsWrapper) error
+	Option func(*OptionWrapper) error
 
-	byteProcessor func([]byte) ([]byte, error)
+	byteProcessor  func([]byte) (int, error)
+	readProcessor  func(io.Reader) io.Reader
+	writeProcessor func(io.Writer) io.Writer
 )
 
 type OptionWrapper struct {
 	fs              FS
-	readProcessors  []byteProcessor
-	writeProcessors []byteProcessor
+	readProcessors  []readProcessor
+	writeProcessors []writeProcessor
 }
 
 func (w *OptionWrapper) Open(name string) (File, error) {
-	return w.OpenContext(context.Background(), name)
-}
-
-func (w *OptionWrapper) OpenContext(ctx context.Context, name string) (File, error) {
-	return newWrapperFile(w.fs.OpenContext(ctx, name), w)
+	return w.OpenFile(name, O_RDONLY, 0)
 }
 
 func (w *OptionWrapper) OpenFile(name string, flag int, perm fs.FileMode) (File, error) {
-	return w.OpenFileContext(context.Background(), name, flag, perm)
-}
+	file, err := w.fs.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
 
-func (w *OptionWrapper) OpenFileContext(ctx context.Context, name string, flag int, perm fs.FileMode) (File, error) {
-	return newWrapperFile(w.fs.OpenFileContext(ctx, name, flag, perm), w)
+	return &FileWrapper{
+		File: file,
+		fs:   w,
+	}, nil
 }
 
 func (w *OptionWrapper) Mkdir(name string, perm fs.FileMode) error {
-	return w.MkdirContext(context.Background())
-}
-
-func (w *OptionWrapper) MkdirContext(ctx context.Context, name string, perm fs.FileMode) error {
-	return w.fs.MkdirContext(ctx, name, perm)
+	return w.fs.Mkdir(name, perm)
 }
 
 func (w *OptionWrapper) MkdirAll(path string, perm fs.FileMode) error {
-	return w.MkdirAllContext(context.Background(), path, perm)
-}
-
-func (w *OptionWrapper) MkdirAllContext(ctx context.Context, path string, perm fs.FileMode) error {
-	return w.fs.MkdirAllContext(ctx, path, perm)
+	return w.fs.MkdirAll(path, perm)
 }
 
 func (w *OptionWrapper) Remove(name ...string) error {
-	return w.RemoveContext(context.Background(), name...)
+	return w.fs.Remove(name...)
 }
 
-func (w *OptionWrapper) RemoveContext(ctx context.Context, name ...string) error {
-	return w.fs.RemoveContext(ctx, name...)
+func (w OptionWrapper) WithContext(ctx context.Context) OptionWrapper {
+	w.fs = w.fs.WithContext(ctx)
+
+	return w
 }
 
 type FileWrapper struct {
@@ -69,85 +64,56 @@ type FileWrapper struct {
 func newWrapperFile(f File, fs *OptionWrapper) FileWrapper {
 	return FileWrapper{
 		File: f,
-		fs,
+		fs:   fs,
 	}
 }
 
-func (f *FileWrapper) Read(b []byte) (int, error) {
-	return f.ReadContext(context.Background(), b)
+func (f FileWrapper) WithContext(ctx context.Context) File {
+	fc := f
+	fc.File = f.File.WithContext(ctx)
+
+	return &fc
 }
 
-func (f *FileWrapper) ReadContext(ctx context.Context, b []byte) (int, error) {
-	src := []byte{}
-	count, err := f.File.ReadContext(ctx, src)
-	if err != nil {
-		return 0, err
-	}
+func (f *FileWrapper) Read(p []byte) (int, error) {
+	var reader io.Reader = f.File
 
 	for _, fn := range f.fs.readProcessors {
-		src, err = fn(src)
-		if err != nil {
-			return 0, err
-		}
+		reader = fn(reader)
 	}
 
-	return copy(b, src)
+	return reader.Read(p)
 }
 
-func (f *FileWrapper) Write(b []byte) (int, error) {
-	return f.WriteContext(context.Background(), b)
-}
-
-func (f *FileWrapper) WriteContext(ctx context.Context, b []byte) (int, error) {
-	src := b
-	var err error
+func (f *FileWrapper) Write(p []byte) (int, error) {
+	var writer io.Writer = f.File
 
 	for _, fn := range f.fs.writeProcessors {
-		src, err = fn(src)
-		if err != nil {
-			return 0, err
-		}
+		writer = fn(writer)
 	}
 
-	return f.File.WriteContext(ctx, src)
+	return writer.Write(p)
 }
 
 // WithAESEncryption encrypts and decrypts file when reading/writing
 func WithAESEcryption(key []byte) Option {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return b, err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return b, err
-	}
-
-	gSize := gcm.NonceSize()
-
-	return func(wrapper *OptionWrapper) {
-		wrapper.readProcessors = append(wrapper.readProcessors, func(b []byte) ([]byte, error) {
-			nonce := b[:gSize]
-			cipherText := b[gSize:]
-
-			plainBytes, err := gcm.Open(nil, nonce, cipherText, nil)
-			if err != nil {
-				return b, nil
-			}
-
-			return plainBytes
+	return func(wrapper *OptionWrapper) error {
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return err
+		}
+		wrapper.readProcessors = append(wrapper.readProcessors, func(r io.Reader) io.Reader {
+			var iv [aes.BlockSize]byte
+			stream := cipher.NewOFB(block, iv[:])
+			return &cipher.StreamReader{S: stream, R: r}
 		})
 
-		wrapper.writeProcessors = append(wrapper.writeProcessors, func(b []byte) ([]byte, error) {
-			nonce := make([]byte, gSize)
-			if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-				return b, err
-			}
-
-			cipherText := gcm.Seal(nonce, nonce, b, nil)
-
-			return cipherText
+		wrapper.writeProcessors = append(wrapper.writeProcessors, func(w io.Writer) io.Writer {
+			var iv [aes.BlockSize]byte
+			stream := cipher.NewOFB(block, iv[:])
+			return &cipher.StreamWriter{S: stream, W: w}
 		})
+
+		return nil
 	}
 }
