@@ -1,0 +1,17 @@
+version: '3.8'
+
+volumes:
+  minio-storage: {}
+
+services:
+  minio:
+    image: minio/minio
+    command: server /data
+    volumes:
+    - minio-storage:/data
+    ports:
+    - "9000:9000"
+    environment:
+      MINIO_ACCESS_KEY: access_key
+      MINIO_SECRET_KEY: secret_key
+      MINIO_DOMAIN: localhost
